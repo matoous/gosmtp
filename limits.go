@@ -1,4 +1,4 @@
-package mta
+package gosmtp
 
 import "time"
 

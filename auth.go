@@ -1,11 +1,8 @@
-package mta
+package gosmtp
 
 import (
 	"encoding/base64"
-	"gosmtp/mail"
 	"strings"
-
-	"go.uber.org/zap"
 )
 
 /*
@@ -15,18 +12,18 @@ authentication mechanisms
 var SupportedAuthMechanisms = []string{"LOGIN", "PLAIN"}
 
 func (s *session) handleLoginAuth(cmd *command) {
-	args := cmd.Args()
+	args := cmd.arguments
 	var username string
 	var password []byte
 	if len(args) == 1 {
 		s.Out("334 VXNlcm5hbWU6")
 		s.bufin.Scan()
 		cmd := strings.TrimSpace(s.bufin.Text())
-		s.log.Debug(cmd)
+		s.log.Printf("INFO: received AUTH cmd: '%s'", cmd)
 		data, err := base64.StdEncoding.DecodeString(cmd)
 		if err != nil {
 			s.Out("501 malformed auth input")
-			s.log.Info("malformed auth input", zap.String("cmd", cmd))
+			s.log.Printf("DEBUG: malformed auth input: '%s'", cmd)
 			s.state = sessionStateAborted
 			return
 		}
@@ -34,11 +31,11 @@ func (s *session) handleLoginAuth(cmd *command) {
 		s.Out("334 UGFzc3dvcmQ6")
 		s.bufin.Scan()
 		cmd = strings.TrimSpace(s.bufin.Text())
-		s.log.Debug(cmd)
+		s.log.Printf("INFO: received second AUTH cmd: '%s'", cmd)
 		password, err = base64.StdEncoding.DecodeString(cmd)
 		if err != nil {
 			s.Out("501 malformed auth input")
-			s.log.Info("malformed auth input", zap.String("cmd", cmd))
+			s.log.Printf("DEBUG: malformed auth input: '%s'", cmd)
 			s.state = sessionStateAborted
 			return
 		}
@@ -46,7 +43,7 @@ func (s *session) handleLoginAuth(cmd *command) {
 		data, err := base64.StdEncoding.DecodeString(args[1])
 		if err != nil {
 			s.Out("501 malformed auth input")
-			s.log.Info("malformed auth input", zap.String("cmd", cmd.data))
+			s.log.Printf("DEBUG: malformed auth input: '%s'", cmd)
 			s.state = sessionStateAborted
 			return
 		}
@@ -54,11 +51,11 @@ func (s *session) handleLoginAuth(cmd *command) {
 		s.Out("334 UGFzc3dvcmQ6")
 		s.bufin.Scan()
 		cmd := s.bufin.Text()
-		s.log.Debug(cmd)
+		s.log.Printf("INFO: received second AUTH cmd: '%s'", cmd)
 		password, err = base64.StdEncoding.DecodeString(cmd)
 		if err != nil {
 			s.Out("501 malformed auth input")
-			s.log.Info("malformed auth input", zap.String("cmd", cmd))
+			s.log.Printf("DEBUG: malformed auth input: '%s'", cmd)
 			s.state = sessionStateAborted
 			return
 		}
@@ -66,26 +63,26 @@ func (s *session) handleLoginAuth(cmd *command) {
 
 	// check login
 	// check login
-	ok, err := s.srv.authFunc(username, password)
+	s.peer.Username = username
+	ok, err := s.srv.Authenticator(s.peer, password)
 	if err != nil {
-		s.Out(mail.Codes.ErrorAuth)
+		s.Out(Codes.ErrorAuth)
 		s.state = sessionStateAborted
 		return
 	}
 	if !ok {
-		s.Out(mail.Codes.FailAuthentication)
+		s.Out(Codes.FailAuthentication)
 		s.state = sessionStateAborted
 		return
 	}
-	s.authenticatedUser = username
 
 	// login succeeded
-	s.authenticated = true
-	s.Out(mail.Codes.SuccessAuthentication)
+	s.peer.Authenticated = true
+	s.Out(Codes.SuccessAuthentication)
 }
 
 func (s *session) handlePlainAuth(cmd *command) {
-	args := cmd.Args()
+	args := cmd.arguments
 	var authData []byte
 	var err error
 	// check that PLAIN auth input is of valid form
@@ -93,15 +90,15 @@ func (s *session) handlePlainAuth(cmd *command) {
 		s.Out("334")
 		s.bufin.Scan()
 		cmd, err := parseCommand(s.bufin.Text())
-		s.log.Debug(cmd.data)
+		s.log.Printf("INFO: received AUTH cmd: '%s'", cmd)
 		if err != nil {
-			s.Out(mail.Codes.FailUnrecognizedCmd)
+			s.Out(Codes.FailUnrecognizedCmd)
 			s.badCommandsCount++
 		}
-		authData, err = base64.StdEncoding.DecodeString(cmd.Args()[0])
+		authData, err = base64.StdEncoding.DecodeString(cmd.arguments[0])
 		if err != nil {
 			s.Out("501 malformed auth input")
-			s.log.Info("malformed auth input", zap.String("cmd", cmd.data))
+			s.log.Printf("DEBUG: malformed auth input: '%s'", cmd)
 			s.state = sessionStateAborted
 			return
 		}
@@ -109,7 +106,7 @@ func (s *session) handlePlainAuth(cmd *command) {
 		authData, err = base64.StdEncoding.DecodeString(args[1])
 		if err != nil {
 			s.Out("501 malformed auth input")
-			s.log.Info("malformed auth input", zap.String("cmd", cmd.data))
+			s.log.Printf("DEBUG: malformed auth input: '%s'", cmd)
 			s.state = sessionStateAborted
 			return
 		}
@@ -130,20 +127,20 @@ func (s *session) handlePlainAuth(cmd *command) {
 	authPasswd := t[2]
 
 	// check login
-	ok, err := s.srv.authFunc(authLogin, authPasswd)
+	s.peer.Username = authLogin
+	ok, err := s.srv.Authenticator(s.peer, authPasswd)
 	if err != nil {
-		s.Out(mail.Codes.ErrorAuth)
+		s.Out(Codes.ErrorAuth)
 		s.state = sessionStateAborted
 		return
 	}
 	if !ok {
-		s.Out(mail.Codes.FailAuthentication)
+		s.Out(Codes.FailAuthentication)
 		s.state = sessionStateAborted
 		return
 	}
-	s.authenticatedUser = authLogin
+	s.peer.Authenticated = true
 
 	// login succeeded
-	s.authenticated = true
-	s.Out(mail.Codes.SuccessAuthentication)
+	s.Out(Codes.SuccessAuthentication)
 }

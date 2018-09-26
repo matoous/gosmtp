@@ -1,4 +1,4 @@
-package mail
+package gosmtp
 
 import "fmt"
 
@@ -33,31 +33,31 @@ func (c class) String() string {
 type subject int
 
 const (
-	// There is no additional subject information available
+	// SubjectUndefined - There is no additional subject information available
 	SubjectUndefined = 0
-	// The address status reports on the originator or destination address.
+	// SubjectAddressing - The address status reports on the originator or destination address.
 	// It may include address syntax or validity.
 	// These errors can generally be corrected by the sender and retried.
 	SubjectAddressing = 1
-	// Mailbox status indicates that something having to do with the mailbox has caused this DSN.
+	// SubjectMailbox - Mailbox status indicates that something having to do with the mailbox has caused this DSN.
 	// Mailbox issues are assumed to be under the general control of the recipient.
 	SubjectMailbox = 2
-	//Mail system status indicates that something having to do with the destination system has caused this DSN.
-	//System issues are assumed to be under the general control of the destination system administrator.
+	// SubjectMail - Mail system status indicates that something having to do with the destination system has caused this DSN.
+	// System issues are assumed to be under the general control of the destination system administrator.
 	SubjectMail = 3
-	// The networking or routing codes report status about the delivery system itself.
+	// SubjectNetwork - The networking or routing codes report status about the delivery system itself.
 	// These system components include any necessary infrastructure such as directory and routing services.
 	// Network issues are assumed to be under the control of the destination or intermediate system administrator.
 	SubjectNetwork = 4
-	//	The mail delivery protocol status codes report failures involving the message delivery protocol.
+	// SubjectDelivery - The mail delivery protocol status codes report failures involving the message delivery protocol.
 	// These failures include the full range of problems resulting from implementation errors or an unreliable connection.
 	SubjectDelivery = 5
-	// The message content or media status codes report failures involving the content of the message.
+	// SubjectContent - The message content or media status codes report failures involving the content of the message.
 	// These codes report failures due to translation, transcoding, or otherwise unsupported message media.
 	// Message content or media issues are under the control of both the sender and the receiver,
 	// both of which must support a common set of supported content-types.
 	SubjectContent = 6
-	// The security or policy status codes report failures involving policies such as per-recipient or
+	// SubjectPolicy - The security or policy status codes report failures involving policies such as per-recipient or
 	// per-host filtering and cryptographic operations.
 	// Security and policy status issues are assumed to be under the control of either or both the sender and recipient.
 	// Both the sender and recipient must permit the exchange of messages and arrange the exchange of necessary keys and
@@ -182,6 +182,9 @@ type Responses struct {
 	FailAccessDenied                       string
 	FailBadSequence                        string
 	FailInvalidRecipient                   string
+	FailEncryptionNeeded                   string
+	FailMissingArgument                    string
+	FailUndefinedSecurityStatus            string
 
 	// The 400's
 	ErrorTooManyRecipients      string
@@ -453,6 +456,13 @@ func init() {
 		Comment:      "Domain cannot exceed 255 characters",
 	}).String()
 
+	Codes.FailMissingArgument = (&Response{
+		EnhancedCode: InvalidCommandArguments,
+		BasicCode:    550,
+		Class:        ClassPermanentFailure,
+		Comment:      "Argument is missing in you command",
+	}).String()
+
 	Codes.FailBackendNotRunning = (&Response{
 		EnhancedCode: OtherOrUndefinedProtocolStatus,
 		BasicCode:    554,
@@ -515,52 +525,69 @@ func init() {
 		Class:        ClassPermanentFailure,
 		Comment:      "Bad sender address syntax",
 	}).String()
+
+	Codes.FailEncryptionNeeded = (&Response{
+		EnhancedCode: EncryptionNeeded,
+		BasicCode:    523,
+		Class:        ClassPermanentFailure,
+		Comment:      "TLS required, use STARTTLS",
+	}).String()
+
+	Codes.FailUndefinedSecurityStatus = (&Response{
+		EnhancedCode: SecurityStatus,
+		BasicCode:    550,
+		Class:        ClassPermanentFailure,
+		Comment:      "Undefined security failure",
+	}).String()
 }
 
 // DefaultMap contains defined default codes (RfC 3463)
 const (
-	OtherStatus                             = ".0.0"
-	OtherAddressStatus                      = ".1.0"
-	BadDestinationMailboxAddress            = ".1.1"
-	BadDestinationSystemAddress             = ".1.2"
-	BadDestinationMailboxAddressSyntax      = ".1.3"
-	DestinationMailboxAddressAmbiguous      = ".1.4"
-	DestinationMailboxAddressValid          = ".1.5"
-	MailboxHasMoved                         = ".1.6"
-	BadSendersMailboxAddressSyntax          = ".1.7"
-	BadSendersSystemAddress                 = ".1.8"
-	OtherOrUndefinedMailboxStatus           = ".2.0"
-	MailboxDisabled                         = ".2.1"
-	MailboxFull                             = ".2.2"
-	MessageLengthExceedsAdministrativeLimit = ".2.3"
-	MailingListExpansionProblem             = ".2.4"
-	OtherOrUndefinedMailSystemStatus        = ".3.0"
-	MailSystemFull                          = ".3.1"
-	SystemNotAcceptingNetworkMessages       = ".3.2"
-	SystemNotCapableOfSelectedFeatures      = ".3.3"
-	MessageTooBigForSystem                  = ".3.4"
-	OtherOrUndefinedNetworkOrRoutingStatus  = ".4.0"
-	NoAnswerFromHost                        = ".4.1"
-	BadConnection                           = ".4.2"
-	RoutingServerFailure                    = ".4.3"
-	UnableToRoute                           = ".4.4"
-	NetworkCongestion                       = ".4.5"
-	RoutingLoopDetected                     = ".4.6"
-	DeliveryTimeExpired                     = ".4.7"
-	OtherOrUndefinedProtocolStatus          = ".5.0"
-	InvalidCommand                          = ".5.1"
-	SyntaxError                             = ".5.2"
-	TooManyRecipients                       = ".5.3"
-	InvalidCommandArguments                 = ".5.4"
-	WrongProtocolVersion                    = ".5.5"
-	OtherOrUndefinedMediaError              = ".6.0"
-	MediaNotSupported                       = ".6.1"
-	ConversionRequiredAndProhibited         = ".6.2"
-	ConversionRequiredButNotSupported       = ".6.3"
-	ConversionWithLossPerformed             = ".6.4"
-	ConversionFailed                        = ".6.5"
-	SecurityStatus                          = ".7.0"
-	DeliveryNotAuthorized                   = ".7.1"
+	OtherStatus                               = ".0.0"
+	OtherAddressStatus                        = ".1.0"
+	BadDestinationMailboxAddress              = ".1.1"
+	BadDestinationSystemAddress               = ".1.2"
+	BadDestinationMailboxAddressSyntax        = ".1.3"
+	DestinationMailboxAddressAmbiguous        = ".1.4"
+	DestinationMailboxAddressValid            = ".1.5"
+	MailboxHasMoved                           = ".1.6"
+	BadSendersMailboxAddressSyntax            = ".1.7"
+	BadSendersSystemAddress                   = ".1.8"
+	OtherOrUndefinedMailboxStatus             = ".2.0"
+	MailboxDisabled                           = ".2.1"
+	MailboxFull                               = ".2.2"
+	MessageLengthExceedsAdministrativeLimit   = ".2.3"
+	MailingListExpansionProblem               = ".2.4"
+	OtherOrUndefinedMailSystemStatus          = ".3.0"
+	MailSystemFull                            = ".3.1"
+	SystemNotAcceptingNetworkMessages         = ".3.2"
+	SystemNotCapableOfSelectedFeatures        = ".3.3"
+	MessageTooBigForSystem                    = ".3.4"
+	OtherOrUndefinedNetworkOrRoutingStatus    = ".4.0"
+	NoAnswerFromHost                          = ".4.1"
+	BadConnection                             = ".4.2"
+	RoutingServerFailure                      = ".4.3"
+	UnableToRoute                             = ".4.4"
+	NetworkCongestion                         = ".4.5"
+	RoutingLoopDetected                       = ".4.6"
+	DeliveryTimeExpired                       = ".4.7"
+	OtherOrUndefinedProtocolStatus            = ".5.0"
+	InvalidCommand                            = ".5.1"
+	SyntaxError                               = ".5.2"
+	TooManyRecipients                         = ".5.3"
+	InvalidCommandArguments                   = ".5.4"
+	WrongProtocolVersion                      = ".5.5"
+	OtherOrUndefinedMediaError                = ".6.0"
+	MediaNotSupported                         = ".6.1"
+	ConversionRequiredAndProhibited           = ".6.2"
+	ConversionRequiredButNotSupported         = ".6.3"
+	ConversionWithLossPerformed               = ".6.4"
+	ConversionFailed                          = ".6.5"
+	SecurityStatus                            = ".7.0"
+	DeliveryNotAuthorized                     = ".7.1"
+	MailingListExpansionProhibited            = ".7.2"
+	SecurityConversionRequiredButNotSupported = ".7.3"
+	EncryptionNeeded                          = ".7.10"
 )
 
 var defaultTexts = struct {

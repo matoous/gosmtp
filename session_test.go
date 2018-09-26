@@ -1,34 +1,53 @@
-package mta
+package gosmtp
 
 import (
+	"fmt"
+	"log"
 	"net"
 	"net/smtp"
+	"os"
 	"testing"
+	"net/mail"
 
 	"github.com/stretchr/testify/assert"
 )
 
-func RunTestingServer() {
-	srv, err := NewServer(testConfig, testHandler, dummyValidator)
+// dummyMailHandler dumps the email to stdout upon receiving it
+func dummyHandle(peer *Peer, envelope *Envelope) (id string, err error) {
+	fmt.Printf("Dummy mail\nFrom: %v\nTo: %v\nMail:\n%v\n", envelope.MailFrom, envelope.MailTo, envelope.Mail)
+	return "x", nil
+}
+
+// dummyValidator always returns nil as if the recipient was alright
+func dummyChecker(peer *Peer, mail *mail.Address) error {
+	return nil
+}
+
+func init() {
+	srv, err := NewServer(":4344", log.New(os.Stdout, "", log.LstdFlags))
 	if err != nil {
 		panic(err)
 	}
 
-	err = srv.ListenAndServe()
-	if err != nil {
-		panic(err)
-	}
+	srv.Handler = dummyHandle
+	srv.RecipientChecker = dummyChecker
+
+	go func() {
+		err := srv.ListenAndServe()
+		if err != nil {
+			panic(err)
+		}
+	}()
 }
 
 func TestSession_Extensions(t *testing.T) {
-	go RunTestingServer()
 	SMTPUTF8(t)
 	PIPELINING(t)
 	HELP(t)
 }
 
 func HELP(t *testing.T) {
-	conn, err := net.Dial("tcp", "localhost:7654")
+	conn, err := net.Dial("tcp", "localhost:4344")
 	if err != nil {
 		panic(err)
 	}
@@ -47,7 +66,7 @@ func HELP(t *testing.T) {
 }
 
 func PIPELINING(t *testing.T) {
-	conn, err := net.Dial("tcp", "localhost:7654")
+	conn, err := net.Dial("tcp", "localhost:4344")
 	if err != nil {
 		panic(err)
 	}
@@ -69,7 +88,7 @@ func PIPELINING(t *testing.T) {
 }
 
 func SMTPUTF8(t *testing.T) {
-	conn, err := smtp.Dial("localhost:7654")
+	conn, err := smtp.Dial("localhost:4344")
 	if err != nil {
 		panic(err)
 	}
@@ -101,9 +120,7 @@ func SMTPUTF8(t *testing.T) {
 }
 
 func TestSession_Postmaster(t *testing.T) {
-	go RunTestingServer()
-
-	conn, err := smtp.Dial("localhost:7654")
+	conn, err := smtp.Dial("localhost:4344")
 	if err != nil {
 		panic(err)
 	}
@@ -122,9 +139,7 @@ func TestSession_Postmaster(t *testing.T) {
 }
 
 func TestSession_Serve(t *testing.T) {
-	go RunTestingServer()
-
-	conn, err := smtp.Dial("localhost:7654")
+	conn, err := smtp.Dial("localhost:4344")
 	if err != nil {
 		panic(err)
 	}
@@ -135,7 +150,7 @@ func TestSession_Serve(t *testing.T) {
 	err = conn.Quit()
 	assert.NoError(t, err, "error when quiting the connection")
 
-	conn, err = smtp.Dial("localhost:7654")
+	conn, err = smtp.Dial("localhost:4344")
 	if err != nil {
 		panic(err)
 	}
@@ -149,13 +164,15 @@ func TestSession_Serve(t *testing.T) {
 	err = conn.Rcpt("test@other.te")
 	assert.NoError(t, err, "error when sending RCPT")
 
-	wr, err := conn.Data()
-	assert.NoError(t, err, "error when sending DATA")
+	if err != nil {
+		wr, err := conn.Data()
+		assert.NoError(t, err, "error when sending DATA")
 
-	written, err := wr.Write([]byte("Hello!"))
-	assert.NoError(t, err, "error when sending message")
-	assert.Equal(t, written, 6, "message sent only partialy")
+		written, err := wr.Write([]byte("Hello!"))
+		assert.NoError(t, err, "error when sending message")
+		assert.Equal(t, written, 6, "message sent only partialy")
 
-	err = wr.Close()
-	assert.NoError(t, err, "error when ending sending message")
+		err = wr.Close()
+		assert.NoError(t, err, "error when ending sending message")
+	}
 }

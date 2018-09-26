@@ -1,4 +1,4 @@
-package mta
+package gosmtp
 
 import (
 	"errors"
@@ -9,6 +9,7 @@ type command struct {
 	commandCode int
 	verb        string
 	data        string
+	arguments   []string
 }
 
 const (
@@ -96,18 +97,19 @@ func parseCommand(line string) (*command, error) {
 	cmd := &command{
 		cmdCode,
 		parts[0],
-		"",
+		line,
+		nil,
 	}
 
 	if len(parts) > 1 {
-		cmd.data = parts[1]
+		cmd.arguments = strings.Split(parts[1], " ")
 	}
 
 	// Check for verbs defined not to have an argument
 	// (RFC 5321 s4.1.1)
 	switch cmd.commandCode {
 	case rsetCmd, dataCmd, quitCmd:
-		if cmd.data != "" {
+		if len(cmd.arguments) != 0 {
 			return nil, errors.New("unexpected argument")
 		}
 	}
@@ -118,18 +120,5 @@ func parseCommand(line string) (*command, error) {
 String returns back the original line with command as a string
 */
 func (cmd *command) String() string {
-	if cmd.data != "" {
-		return cmd.verb + " " + cmd.data
-	}
-	return cmd.verb
-}
-
-/*
-Args returns array of strings with individual command arguments
-*/
-func (cmd *command) Args() []string {
-	if cmd.data == "" {
-		return nil
-	}
-	return strings.Split(cmd.data, " ")
+	return cmd.data
 }

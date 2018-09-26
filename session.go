@@ -1,19 +1,16 @@
-package mta
+package gosmtp
 
 import (
 	"bufio"
 	"bytes"
 	"crypto/tls"
 	"fmt"
-	"gosmtp/config"
-	"gosmtp/mail"
 	"io"
+	"log"
 	"net"
 	"strconv"
 	"strings"
 	"time"
-
-	"go.uber.org/zap"
 )
 
 type sessionState int
@@ -29,18 +26,45 @@ const (
 	sessionStateWaitingForQuit
 )
 
+// Protocol represents the protocol used in the SMTP session
+type Protocol string
+
+const (
+	// SMTP - plain old SMTP
+	SMTP Protocol = "SMTP"
+
+	// ESMTP - Extended SMTP
+	ESMTP = "ESMTP"
+)
+
+// Peer represents the client connecting to the server
+type Peer struct {
+	HeloName        string
+	HeloType        string
+	Protocol        Protocol
+	ServerName      string
+	Username        string
+	Authenticated   bool
+	Addr            net.Addr
+	TLS             *tls.ConnectionState
+	AdditionalField map[string]interface{}
+}
+
 // session wraps underlying SMTP connection for easier handling
 type session struct {
-	conn             net.Conn       // connection
-	bufin            *bufio.Scanner // scanner
-	bufout           *bufio.Writer  // writer
-	id               string         // email id
-	envelope         *mail.Envelope // session envelope
-	state            sessionState   // session state
-	badCommandsCount int            // amount of bad commands
-	vrfyCount        int            // amount of vrfy commands received during current session
-	start            time.Time      // start time of the session
+	conn   net.Conn       // connection
+	bufin  *bufio.Scanner // scanner
+	bufout *bufio.Writer  // writer
+	id     string         // email id
+
+	envelope         *Envelope    // session envelope
+	state            sessionState // session state
+	badCommandsCount int          // amount of bad commands
+	vrfyCount        int          // amount of vrfy commands received during current session
+	start            time.Time    // start time of the session
 	bodyType         string
+
+	peer *Peer
 
 	// tls info
 	tls      bool // tls enabled
@@ -51,11 +75,7 @@ type session struct {
 	helloHost string
 	helloSeen bool
 
-	// authentication info
-	authenticated     bool   // true after successful auth dialog
-	authenticatedUser string // User authenticated for current session
-
-	log *zap.Logger // logger
+	log *log.Logger // logger
 	srv *Server     // serve handling this request
 }
 
@@ -67,13 +87,13 @@ func (s *session) Reset() {
 
 // DoneAndReset resets current after receiving DATA successfully
 func (s *session) DoneAndReset() {
-	s.envelope = &mail.Envelope{}
+	s.envelope.Reset()
 	s.state = sessionStateInit
 }
 
 func (s *session) Out(msgs ...string) {
 	// log
-	s.log.Debug("returning msg:", zap.Strings("msgs", msgs))
+	s.log.Printf("INFO: returning msg: '%v'", msgs)
 
 	s.conn.SetWriteDeadline(time.Now().Add(DefaultLimits.ReplyOut))
 	for _, msg := range msgs {
@@ -81,7 +101,7 @@ func (s *session) Out(msgs ...string) {
 		s.bufout.Write([]byte("\r\n"))
 	}
 	if err := s.bufout.Flush(); err != nil {
-		s.log.Error("flush", zap.Error(err))
+		s.log.Printf("ERROR: flush error: %s", err.Error())
 		s.state = sessionStateAborted
 	}
 }
@@ -99,16 +119,16 @@ func (s *session) Serve() {
 	for s.bufin.Scan() {
 		cmd, err := parseCommand(s.bufin.Text())
 		if err != nil {
-			s.Out(mail.Codes.FailUnrecognizedCmd)
+			s.Out(Codes.FailUnrecognizedCmd)
 			s.badCommandsCount++
 			continue
 		}
 		if s.state == sessionStateWaitingForQuit && cmd.commandCode != quitCmd {
-			s.Out(mail.Codes.FailBadSequence)
+			s.Out(Codes.FailBadSequence)
 			s.badCommandsCount++
 			continue
 		}
-		s.log.Debug(cmd.String())
+		s.log.Printf("INFO: received command: '%s'", cmd.String())
 		// select the right handler by commandCode
 		handler := handlers[cmd.commandCode]
 		handler(s, cmd)
@@ -116,27 +136,22 @@ func (s *session) Serve() {
 			break
 		}
 		// TODO is this legal?
-		if s.badCommandsCount == s.srv.limits.BadCmds {
-			s.Out(mail.Codes.FailMaxUnrecognizedCmd)
+		if s.badCommandsCount == s.srv.Limits.BadCmds {
+			s.Out(Codes.FailMaxUnrecognizedCmd)
 			s.state = sessionStateAborted
 			break
 		}
 		// TODO timeout might differ as per https://tools.ietf.org/html/rfc5321#section-4.5.3.2
-		s.conn.SetReadDeadline(time.Now().Add(s.srv.limits.CmdInput))
+		s.conn.SetReadDeadline(time.Now().Add(s.srv.Limits.CmdInput))
 	}
 	if err := s.bufin.Err(); err != nil {
-		s.log.Error("bufin err", zap.Error(err))
+		s.log.Printf("ERROR: bufin error: '%s'", err.Error())
 	}
 }
 
 // send Welcome upon new session creation
 func (s *session) handleWelcome() {
-	cfg := s.srv.config
-	smtpVersion := "SMTP"
-	if cfg.TLSEnabled {
-		smtpVersion = "ESMTP"
-	}
-	s.Out(fmt.Sprintf("220 %s %s %s(%s) %s", cfg.LocalName, smtpVersion, cfg.SftName, cfg.SftVersion, cfg.Announce))
+	s.Out(fmt.Sprintf("220 %s ESMTP gomstp(0.0.1) I'm mr. Meeseeks, look at me!", s.peer.ServerName))
 	/*
 		The SMTP protocol allows a server to formally reject a mail session
 		while still allowing the initial connection as follows: a 554
@@ -155,10 +170,17 @@ func (s *session) handleWelcome() {
 // handle Ehlo command
 func handleEhlo(s *session, cmd *command) {
 	s.Reset()
+
 	s.helloSeen = true
 	s.helloType = cmd.commandCode
-	s.helloHost = cmd.Args()[0]
+	// TODO chec cmd args
+	s.helloHost = cmd.arguments[0]
 	// TODO check sending host (SPF)
+	if s.srv.HeloChecker != nil {
+		if err := s.srv.HeloChecker(s.peer, s.helloHost); err != nil {
+			s.Out("550 " + err.Error())
+		}
+	}
 
 	ehloResp := make([]string, 0, 10)
 
@@ -173,7 +195,7 @@ func handleEhlo(s *session, cmd *command) {
 	// https://tools.ietf.org/html/rfc2920
 	ehloResp = append(ehloResp, "250-PIPELINING")
 	// https://tools.ietf.org/html/rfc3207
-	if s.srv.config.TLSEnabled { // do tls for this server
+	if s.srv.TLSConfig != nil { // do tls for this server
 		if !s.tls { // already in tls stream
 			ehloResp = append(ehloResp, "250-STARTTLS")
 		}
@@ -185,7 +207,7 @@ func handleEhlo(s *session, cmd *command) {
 		permit any plaintext password mechanisms, unless
 		either the STARTTLS [SMTP-TLS] command has been negotiated...
 	*/
-	if len(s.srv.authMechanisms) != 0 && s.srv.config.TLSEnabled {
+	if len(s.srv.authMechanisms) != 0 && s.srv.TLSConfig != nil {
 		ehloResp = append(ehloResp, "250-AUTH "+strings.Join(s.srv.authMechanisms, " "))
 	}
 	// https://tools.ietf.org/html/rfc821
@@ -201,8 +223,14 @@ func handleHelo(s *session, cmd *command) {
 	s.Reset()
 	s.helloSeen = true
 	s.helloType = cmd.commandCode
-	s.helloHost = cmd.Args()[0]
+	// TODO check cmd args
+	s.helloHost = cmd.arguments[0]
 	// TODO check sending host (SPF)
+	if s.srv.HeloChecker != nil {
+		if err := s.srv.HeloChecker(s.peer, s.helloHost); err != nil {
+			s.Out("550 " + err.Error())
+		}
+	}
 
 	s.Out(fmt.Sprintf("250 %v hello %v", "mail.example", s.conn.RemoteAddr()))
 }
@@ -211,21 +239,27 @@ func handleHelo(s *session, cmd *command) {
 func handleStartTLS(s *session, cmd *command) {
 	// already started TLS
 	if s.tls {
-		s.state = sessionStateAborted
-		s.Out(mail.Codes.FailBadSequence)
+		s.badCommandsCount++
+		s.Out(Codes.FailBadSequence)
 		return
 	}
 
-	s.Out(mail.Codes.SuccessStartTLSCmd)
+	if s.srv.TLSConfig == nil {
+		s.Out(Codes.FailCmdNotSupported)
+		return
+	}
+
+	s.Out(Codes.SuccessStartTLSCmd)
 
 	// set timeout for TLS connection negotiation
 	s.conn.SetDeadline(time.Now().Add(DefaultLimits.TLSSetup))
-	secureConn := tls.Server(s.conn, &tls.Config{Certificates: s.srv.config.Certificates})
+	secureConn := tls.Server(s.conn, s.srv.TLSConfig)
 
 	// TLS handshake
 	if err := secureConn.Handshake(); err != nil {
-		s.log.Info("start tls err", zap.Error(err))
-		s.state = sessionStateAborted
+		s.log.Printf("ERROR: start tls: '%s'", err.Error())
+		// TODO should we abort?
+		s.Out(Codes.FailUndefinedSecurityStatus)
 		return
 	}
 
@@ -233,8 +267,10 @@ func handleStartTLS(s *session, cmd *command) {
 	s.Reset()
 	s.conn = secureConn
 	s.bufin = bufio.NewScanner(secureConn)
+	s.bufout = bufio.NewWriter(secureConn)
 	s.tls = true
 	s.tlsState = secureConn.ConnectionState()
+	s.peer.TLS = &s.tlsState
 	s.state = sessionStateInit
 }
 
@@ -246,39 +282,58 @@ func handleMail(s *session, cmd *command) {
 	*/
 	s.Reset()
 
+	if !s.tls && s.srv.TLSOnly {
+		s.Out(Codes.FailEncryptionNeeded)
+		return
+	}
+
 	// require authentication if set in settings
-	if len(s.srv.authMechanisms) != 0 && !s.authenticated {
-		s.Out(mail.Codes.FailAccessDenied)
+	if len(s.srv.authMechanisms) != 0 && !s.peer.Authenticated {
+		s.Out(Codes.FailAccessDenied)
 		return
 	}
 
 	// nested mail command
 	if s.envelope.IsSet() {
-		s.Out(mail.Codes.FailNestedMailCmd)
+		s.Out(Codes.FailNestedMailCmd)
 		return
 	}
 
-	args := cmd.Args()
+	args := cmd.arguments
 	if len(args) == 0 {
-		s.log.Debug("Empty arguments for MAIL cmd")
-		s.Out(mail.Codes.FailInvalidAddress)
+		s.log.Print("DEBUG: Empty arguments for MAIL cmd")
+		s.Out(Codes.FailInvalidAddress)
 		return
 	}
 
 	// to lower and check if start with from: and is not empty
 	from := strings.ToLower(strings.TrimSpace(args[0]))
 	if from == "" || !strings.HasPrefix(from, "from:") {
-		s.log.Debug("Invalid address for MAIL cmd")
-		s.Out(mail.Codes.FailInvalidAddress)
+		s.log.Print("DEBUG: Invalid address for MAIL cmd")
+		s.Out(Codes.FailInvalidAddress)
 		return
 	}
 
 	fromParts := strings.Split(from, ":")
 	if len(fromParts) < 2 {
-		s.Out(mail.Codes.FailInvalidAddress)
+		s.Out(Codes.FailInvalidAddress)
 		return
 	}
-	s.envelope.MailFrom = mail.Address(removeBrackets(fromParts[1]))
+
+	mailFrom, err := parseAddress(fromParts[1])
+	if err != nil {
+		s.Out(Codes.FailInvalidAddress)
+		return
+	}
+
+	if s.srv.SenderChecker != nil {
+		if err := s.srv.SenderChecker(s.peer, mailFrom); err != nil {
+			s.Out(Codes.FailAccessDenied + " " + err.Error())
+			return
+		}
+	}
+
+	s.envelope.MailFrom = mailFrom
 	args = args[1:]
 
 	// extensions size
@@ -286,18 +341,18 @@ func handleMail(s *session, cmd *command) {
 		for _, ext := range args {
 			extValue := strings.Split(ext, "=")
 			if len(extValue) != 2 {
-				s.Out(mail.Codes.FailInvalidAddress)
+				s.Out(Codes.FailInvalidAddress)
 				return
 			}
 			switch strings.ToUpper(extValue[0]) {
 			case "SIZE":
 				size, err := strconv.ParseInt(extValue[1], 10, 64)
 				if err != nil {
-					s.Out(mail.Codes.FailInvalidExtension)
+					s.Out(Codes.FailInvalidExtension)
 					return
 				}
 				if int64(size) > DefaultLimits.MsgSize {
-					s.Out(mail.Codes.FailTooBig)
+					s.Out(Codes.FailTooBig)
 					return
 				}
 			case "BODY":
@@ -312,19 +367,13 @@ func handleMail(s *session, cmd *command) {
 				*/
 			default:
 				s.Out("555")
-				s.envelope.MailFrom = ""
+				s.envelope.MailFrom = nil
 			}
 		}
 	}
 
-	// validate email
-	if err := s.envelope.MailFrom.Validate(); err != nil {
-		s.Out(err.Error())
-		return
-	}
-
 	// validate FQN
-	if err := s.envelope.MailFrom.IsFQN(); err != "" {
+	if err := IsFQN(s.envelope.MailFrom); err != "" {
 		s.Out(err)
 		return
 	}
@@ -336,39 +385,39 @@ func handleMail(s *session, cmd *command) {
 		s.state = sessionStateGotMail
 	default:
 		s.state = sessionStateAborted
-		s.Out(mail.Codes.FailBadSequence)
+		s.Out(Codes.FailBadSequence)
 		return
 	}
-	s.Out(mail.Codes.SuccessMailCmd)
+	s.Out(Codes.SuccessMailCmd)
 }
 
 func handleRcpt(s *session, cmd *command) {
 	// if auth is required
-	if len(s.srv.authMechanisms) != 0 && !s.authenticated {
-		s.Out(mail.Codes.FailAccessDenied)
+	if len(s.srv.authMechanisms) != 0 && !s.peer.Authenticated {
+		s.Out(Codes.FailAccessDenied)
 		return
 	}
 
 	// HELO/EHLO needs to be first
 	if !s.helloSeen {
-		s.Out(mail.Codes.FailBadSequence)
+		s.Out(Codes.FailBadSequence)
 		return
 	}
 
 	// check recipients limit
 	if len(s.envelope.MailTo) > DefaultLimits.MaxRcptCount {
-		s.Out(mail.Codes.ErrorTooManyRecipients)
+		s.Out(Codes.ErrorTooManyRecipients)
 		return
 	}
 
-	args := cmd.Args()
+	args := cmd.arguments
 	if args == nil {
-		s.Out(mail.Codes.FailInvalidRecipient)
+		s.Out(Codes.FailInvalidRecipient)
 	}
 
-	t := strings.Split(args[0], ":")
-	if len(t) < 2 || strings.ToUpper(strings.TrimSpace(t[0])) != "TO" {
-		s.Out(mail.Codes.FailInvalidAddress)
+	toParts := strings.Split(args[0], ":")
+	if len(toParts) < 2 || strings.ToUpper(strings.TrimSpace(toParts[0])) != "TO" {
+		s.Out(Codes.FailInvalidAddress)
 		return
 	}
 
@@ -378,40 +427,39 @@ func handleRcpt(s *session, cmd *command) {
 		routes in the forward-path, but they SHOULD ignore the routes or MAY
 		decline to support the relaying they imply.
 	*/
-	rcpt := mail.Address(t[1])
 
-	// must be implemented - RFC5321
-	if strings.ToLower(rcpt.Email()) == "postmaster" {
-		rcpt = mail.Address("postmaster@" + s.srv.config.LocalName)
-	}
-
-	// validate email
-	if err := rcpt.Validate(); err != nil {
-		s.log.Debug("error validating address", zap.String("mail", string(rcpt)), zap.Error(err))
-		s.Out(err.Error())
+	rcpt, err := parseAddress(toParts[1])
+	if err != nil {
+		s.Out(Codes.FailInvalidAddress)
 		return
 	}
 
+	// must be implemented - RFC5321
+	// TODO check we get here
+	if strings.ToLower(rcpt.Address) == "postmaster" {
+		rcpt.Address = "postmaster@" + s.peer.ServerName
+	}
+
 	// be relay for authenticated User
-	if !s.authenticated {
+	if !s.peer.Authenticated {
 		// check valid recipient if this email comes from outside
-		err := s.srv.rcptValidator(rcpt)
+		err := s.srv.RecipientChecker(s.peer, rcpt)
 		if err != nil {
 			if err == ErrorRecipientNotFound {
-				s.Out(mail.Codes.FailMailboxDoesntExist)
+				s.Out(Codes.FailMailboxDoesntExist)
 				return
 			}
 			if err == ErrorRecipientsMailboxFull {
-				s.Out(mail.Codes.FailMailboxFull)
+				s.Out(Codes.FailMailboxFull)
 				return
 			}
-			s.Out(mail.Codes.FailAccessDenied)
+			s.Out(Codes.FailAccessDenied)
 			return
 		}
 	}
 
 	// Add to recipients
-	err := s.envelope.AddRecipient(rcpt)
+	err = s.envelope.AddRecipient(rcpt)
 	if err != nil {
 		s.Out(err.Error())
 		return
@@ -426,10 +474,10 @@ func handleRcpt(s *session, cmd *command) {
 	case sessionStateGotRcpt, sessionStateReadyForData:
 	default:
 		s.state = sessionStateAborted
-		s.Out(mail.Codes.FailBadSequence)
+		s.Out(Codes.FailBadSequence)
 		return
 	}
-	s.Out(mail.Codes.SuccessRcptCmd)
+	s.Out(Codes.SuccessRcptCmd)
 }
 
 func handleVrfy(s *session, _ *command) {
@@ -463,7 +511,7 @@ func handleData(s *session, cmd *command) {
 			The resulting state from this error condition is indeterminate and
 			the transaction MUST be reset with the RSET command.
 		*/
-		s.Out(mail.Codes.FailBadSequence)
+		s.Out(Codes.FailBadSequence)
 		s.state = sessionStateAborted
 		return
 	}
@@ -476,10 +524,10 @@ func handleData(s *session, cmd *command) {
 
 	// check if we are ready for data
 	if s.state == sessionStateReadyForData {
-		s.Out(mail.Codes.SuccessDataCmd)
+		s.Out(Codes.SuccessDataCmd)
 		s.state = sessionStateGettingData
 	} else {
-		s.Out(mail.Codes.FailBadSequence)
+		s.Out(Codes.FailBadSequence)
 		s.state = sessionStateAborted
 		return
 	}
@@ -490,7 +538,7 @@ func handleData(s *session, cmd *command) {
 	// TODO https://tools.ietf.org/html/rfc5321#section-4.5.3.1.6
 	// read data, stop on EOF or reaching maximum sizes
 	var size int64
-	for s.bufin.Scan() && size < s.srv.limits.MsgSize {
+	for s.bufin.Scan() && size < s.srv.Limits.MsgSize {
 		if s.bufin.Text() == "." {
 			break
 		}
@@ -501,15 +549,15 @@ func handleData(s *session, cmd *command) {
 	}
 	// reading ended with error
 	if err := s.bufin.Err(); err != nil {
-		s.log.Error("bufin: ", zap.Error(err))
-		s.Out(fmt.Sprintf(mail.Codes.FailReadErrorDataCmd, err))
+		s.log.Printf("ERROR: bufin: '%s'", err.Error())
+		s.Out(fmt.Sprintf(Codes.FailReadErrorDataCmd, err))
 		s.state = sessionStateAborted
 		return
 	}
 
 	// reading ended by reaching maximum size
-	if size > s.srv.limits.MsgSize {
-		s.Out(mail.Codes.FailTooBig)
+	if size > s.srv.Limits.MsgSize {
+		s.Out(Codes.FailTooBig)
 		return
 	}
 
@@ -519,22 +567,23 @@ func handleData(s *session, cmd *command) {
 		gateway MUST prepend a Received: line, but it MUST NOT alter in any
 		way a Received: line that is already in the header section.
 	*/
-	s.envelope.Headers = s.ReceivedHeader()
+	s.envelope.headers["Received"] = string(s.ReceivedHeader())
 
 	// add Message-ID, is user is aut
-	if s.authenticated {
-		s.envelope.Headers = append(s.envelope.Headers, []byte(fmt.Sprintf("Message-ID: <%d.%s@%s>\r\n", time.Now().Unix(), s.id, config.C.Me))...)
+	if s.peer.Authenticated {
+		s.envelope.headers["Message-ID"] = fmt.Sprintf("Message-ID: <%d.%s@%s>\r\n", time.Now().Unix(), s.id, s.peer.ServerName)
 	}
 
 	// data done
+	s.envelope.Close()
 	s.state = sessionStateDataDone
 
 	// add envelope to delivery system
-	id, err := s.srv.mailHandler.Handle(s.envelope, s.authenticatedUser)
+	id, err := s.srv.Handler(s.peer, s.envelope)
 	if err != nil {
 		s.Out("451 temporary queue error")
 	} else {
-		s.Out(fmt.Sprintf("%v %s", mail.Codes.SuccessMessageQueued, id))
+		s.Out(fmt.Sprintf("%v %s", Codes.SuccessMessageQueued, id))
 	}
 
 	// reset session
@@ -546,17 +595,17 @@ func handleData(s *session, cmd *command) {
 func handleRset(s *session, _ *command) {
 	s.envelope.Reset()
 	s.state = sessionStateInit
-	s.Out(mail.Codes.SuccessResetCmd)
+	s.Out(Codes.SuccessResetCmd)
 }
 
 func handleNoop(s *session, _ *command) {
-	s.Out(mail.Codes.SuccessNoopCmd)
+	s.Out(Codes.SuccessNoopCmd)
 }
 
 func handleQuit(s *session, _ *command) {
-	s.Out(mail.Codes.SuccessQuitCmd)
+	s.Out(Codes.SuccessQuitCmd)
 	s.state = sessionStateAborted
-	s.log.Info("quit remote", zap.String("addr", s.conn.RemoteAddr().String()), zap.Duration("in", time.Since(s.start)))
+	s.log.Printf("INFO: quit remote %s, server in %s", s.peer.Addr, time.Since(s.start))
 }
 
 func handleHelp(s *session, _ *command) {
@@ -567,10 +616,10 @@ func handleHelp(s *session, _ *command) {
 		argument (e.g., any command name) and return more specific
 		information as a response.
 	*/
-	s.Out(mail.Codes.SuccessHelpCmd + " CaN yOu HelP Me PLeasE!")
+	s.Out(Codes.SuccessHelpCmd + " CaN yOu HelP Me PLeasE!")
 }
 func handleBdat(s *session, cmd *command) {
-	args := cmd.Args()
+	args := cmd.arguments
 
 	if s.state == sessionStateDataDone {
 		/*
@@ -585,13 +634,13 @@ func handleBdat(s *session, cmd *command) {
 
 	last := false
 	if len(args) == 0 {
-		s.Out(mail.Codes.FailUnrecognizedCmd) // TODO use the right code
+		s.Out(Codes.FailUnrecognizedCmd) // TODO use the right code
 		return
 	}
 
 	chunkSize64, err := strconv.ParseInt(args[0], 10, 64)
 	if err != nil {
-		s.Out(mail.Codes.FailUnrecognizedCmd) // TODO use the right code
+		s.Out(Codes.FailUnrecognizedCmd) // TODO use the right code
 		s.badCommandsCount++
 		return
 	}
@@ -611,12 +660,12 @@ func handleBdat(s *session, cmd *command) {
 		received, the receiver-SMTP MUST accept and discard the associated
 		message data before sending the appropriate 5XX or 4XX code.
 	*/
-	if n, err := io.Copy(s.envelope.Data, lr); err != nil {
-		s.Out(fmt.Sprintf(mail.Codes.FailReadErrorDataCmd, err))
+	if n, err := io.Copy(s.envelope.data, lr); err != nil {
+		s.Out(fmt.Sprintf(Codes.FailReadErrorDataCmd, err))
 		s.state = sessionStateAborted
 		return
 	} else if n != chunkSize64 {
-		s.Out(fmt.Sprintf(mail.Codes.FailReadErrorDataCmd, err))
+		s.Out(fmt.Sprintf(Codes.FailReadErrorDataCmd, err))
 		s.state = sessionStateAborted
 		return
 	}
@@ -624,6 +673,7 @@ func handleBdat(s *session, cmd *command) {
 	if last {
 		// data done
 		s.Out("250 Message ok, TOTAL octets received") // TODO
+		s.envelope.Close()
 		s.state = sessionStateDataDone
 	} else {
 		/*
@@ -661,9 +711,15 @@ func (s *session) authMechanismValid(mech string) bool {
 }
 
 func handleAuth(s *session, cmd *command) {
+	if !s.tls {
+		// Don't even allow unsecure authentication
+		s.Out(Codes.FailEncryptionNeeded)
+		return
+	}
+
 	// should not happen, some auth is always allowed
 	if len(s.srv.authMechanisms) == 0 {
-		s.Out(mail.Codes.FailCmdNotSupported)
+		s.Out(Codes.FailCmdNotSupported)
 		// AUTH with no AUTH enabled counts as a
 		// bad command. This deals with a few people
 		// who spam AUTH requests at non-supporting
@@ -671,25 +727,24 @@ func handleAuth(s *session, cmd *command) {
 		s.badCommandsCount++
 		return
 	}
+
 	// if authenticatedUser is already
-	if s.authenticated {
+	if s.peer.Authenticated {
 		// RFC4954, section 4: After an AUTH
 		// command has been successfully
 		// completed, no more AUTH commands
 		// may be issued in the same session.
-		s.Out("503 Out of sequence command")
+		s.Out(Codes.FailBadSequence)
 		return
 	}
 
-	args := cmd.Args()
+	args := cmd.arguments
 	if len(args) == 0 {
-		s.Out("501 malformed auth input (#5.5.4)")
-		s.log.Info("malformed auth input:", zap.String("cmd", cmd.String()))
-		s.state = sessionStateAborted
+		s.Out(Codes.FailMissingArgument)
 		return
 	}
 	if !s.authMechanismValid(strings.ToUpper(args[0])) {
-		s.Out(mail.Codes.ErrorCmdParamNotImplemented)
+		s.Out(Codes.ErrorCmdParamNotImplemented)
 		return
 	}
 
@@ -699,7 +754,7 @@ func handleAuth(s *session, cmd *command) {
 	case "LOGIN":
 		s.handleLoginAuth(cmd)
 	default:
-		s.Out(mail.Codes.ErrorCmdParamNotImplemented)
+		s.Out(Codes.ErrorCmdParamNotImplemented)
 		return
 	}
 }
@@ -742,9 +797,9 @@ func (s *session) ReceivedHeader() []byte {
 	receivedHeader.WriteString(remotePort)
 
 	// authenticated
-	if len(s.authenticatedUser) != 0 {
+	if s.peer.Authenticated {
 		receivedHeader.WriteString(" authenticated as ")
-		receivedHeader.WriteString(s.authenticatedUser)
+		receivedHeader.WriteString(s.peer.Username)
 	}
 	receivedHeader.WriteString(") ")
 
@@ -769,9 +824,7 @@ func (s *session) ReceivedHeader() []byte {
 	}
 
 	// mamail version
-	receivedHeader.WriteString(s.srv.config.SftName)
-	receivedHeader.WriteByte(' ')
-	receivedHeader.WriteString(s.srv.config.SftVersion)
+	receivedHeader.WriteString(" gomstp(0.0.1)")
 
 	receivedHeader.WriteString("; id ")
 	receivedHeader.WriteString(s.id)
@@ -784,8 +837,7 @@ func (s *session) ReceivedHeader() []byte {
 	header := receivedHeader.Bytes()
 
 	// fold header
-	mail.FoldHeader(&header)
-	return header
+	return wrap(header)
 }
 
 var handlers = []func(s *session, cmd *command){

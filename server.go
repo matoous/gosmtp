@@ -1,18 +1,17 @@
-package mta
+package gosmtp
 
 import (
 	"bufio"
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"gosmtp/config"
-	"gosmtp/mail"
+	"log"
 	"net"
+	"net/mail"
 	"sync"
 	"time"
 
 	"github.com/matoous/go-nanoid"
-	"go.uber.org/zap"
 )
 
 /*
@@ -21,7 +20,7 @@ MailHandler can be for example object which passes the email to MDA (mail delive
 for remote delivery or to Dovercot to save the mail to the users inbox
 */
 type MailHandler interface {
-	Handle(envelope *mail.Envelope, user string) (id string, err error)
+	Handle(envelope *Envelope, user string) (id string, err error)
 }
 
 // ErrorRecipientNotFound is returned when the email is inbound but the user is not found
@@ -31,36 +30,43 @@ var ErrorRecipientNotFound = errors.New("Couldn't find recipient with given emai
 var ErrorRecipientsMailboxFull = errors.New("Recipients mailbox is full")
 
 /*
-ValidRcptFunc takes mail address as argument and returns nil if address is valid local recipient
-and error otherwise
-*/
-type ValidRcptFunc func(mail.Address) error
-
-/*
-AuthFunc chacks if given email - password combination is valid
-*/
-type AuthFunc func(string, []byte) (bool, error)
-
-/*
 Server - full feature, RFC compliant, SMTP server implementation
 */
 type Server struct {
 	sync.Mutex
-	Addr           string               // TCP address to listen on, ":25" if empty
-	Hostname       string               // hostname, e.g. the domain which the server runs on
-	tlcConfig      *tls.Config          // TLS configuration
-	config         *config.ServerConfig // server configuration
-	mailHandler    MailHandler          // object on which the Handle method is called when the whole mail is received
-	limits         Limits               // server limits
-	log            *zap.Logger          // servers logger
+	Addr           string      // TCP address to listen on, ":25" if empty
+	Hostname       string      // hostname, e.g. the domain which the server runs on
+	TLSConfig      *tls.Config // TLS configuration
+	TLSOnly        bool
+	log            *log.Logger          // servers logger
 	authMechanisms []string             // announced authentication mechanisms
-	authFunc       AuthFunc             // authentication function
-	rcptValidator  ValidRcptFunc        // valid recipient checking function
-	shuttingDown   bool                 // is the server shutting down?
+
+	shuttingDown bool // is the server shutting down?
+
+	// Limits
+	Limits Limits
+
+	// New e-mails are handed off to this function.
+	// Can be left empty for a NOOP server.
+	// Returned ID should be ID of the queued email if the email is put into outgoing queue
+	// If an error is returned, it will be reported in the SMTP session.
+	Handler func(peer *Peer, env *Envelope) (string, error)
+
+	// Enable PLAIN/LOGIN authentication
+	Authenticator func(peer *Peer, password []byte) (bool, error)
+
+	// Enable various checks during the SMTP session.
+	// Can be left empty for no restrictions.
+	// If an error is returned, it will be reported in the SMTP session.
+	// Use the Error struct for access to error codes.
+	ConnectionChecker func(peer *Peer) error              // Called upon new connection.
+	HeloChecker       func(peer *Peer, name string) error // Called after HELO/EHLO.
+	SenderChecker     func(peer *Peer, addr *mail.Address) error // Called after MAIL FROM.
+	RecipientChecker  func(peer *Peer, addr *mail.Address) error // Called after each RCPT TO.
 }
 
 // Auth sets the authentication function and authentication mechanisms which will be used
-func (srv *Server) Auth(f AuthFunc, mechanisms ...string) error {
+func (srv *Server) Auth(f func(*Peer, []byte) (bool, error), mechanisms ...string) error {
 	if len(mechanisms) != 0 {
 		// Check that all authenticatedUser configured authentication mechanisms are support
 		for _, mech := range mechanisms {
@@ -72,32 +78,24 @@ func (srv *Server) Auth(f AuthFunc, mechanisms ...string) error {
 		mechanisms = SupportedAuthMechanisms
 	}
 	srv.authMechanisms = mechanisms
-	srv.authFunc = f
+	srv.Authenticator = f
 	return nil
 }
 
 /*
 NewServer creates new server
 */
-func NewServer(cfg *config.ServerConfig, handler MailHandler, rcptValidator ValidRcptFunc, limits ...Limits) (*Server, error) {
-	// setup logger for server
-	logger, err := zap.NewDevelopment()
-	if err != nil {
-		return nil, err
-	}
+func NewServer(port string, logger *log.Logger, limits ...Limits) (*Server, error) {
 	s := &Server{
-		config:        cfg,
-		Addr:          cfg.HostPort,
-		mailHandler:   handler,
-		log:           logger,
-		rcptValidator: rcptValidator,
-		shuttingDown:  false,
+		Addr:         port,
+		log:          logger,
+		shuttingDown: false,
 	}
 	// limits are optional, if no limits were provided, use the default ones
 	if len(limits) == 1 {
-		s.limits = limits[0]
+		s.Limits = limits[0]
 	} else {
-		s.limits = DefaultLimits
+		s.Limits = DefaultLimits
 	}
 	return s, nil
 }
@@ -106,34 +104,14 @@ func NewServer(cfg *config.ServerConfig, handler MailHandler, rcptValidator Vali
 // calls Serve to handle requests on incoming connections.
 // Connections are handled securely if it is available
 func (srv *Server) ListenAndServe() error {
-	// Load TCP listener
-	if srv.config.TLSEnabled {
-		var tlsConfig *tls.Config
-		srv.config.Certificates = make([]tls.Certificate, 1)
-		var cert tls.Certificate
-		if srv.config.TLSCertFile != "" && srv.config.TLSKeyFile != "" {
-			var err error
-			cert, err = tls.LoadX509KeyPair(srv.config.TLSCertFile, srv.config.TLSKeyFile)
-			if err != nil {
-				srv.log.Error("no TLS: ", zap.Error(err))
-				return err
-			}
-			tlsConfig = &tls.Config{
-				Certificates:       []tls.Certificate{cert},
-				InsecureSkipVerify: true,
-			}
-		} else {
-			srv.log.Error("TLS enabled but no key and cert provided")
-			return errors.New("not TLS key and cert")
-		}
-		l, err := tls.Listen("tcp", srv.config.HostPort, tlsConfig)
+	if srv.TLSConfig != nil {
+		l, err := tls.Listen("tcp", srv.Addr, srv.TLSConfig)
 		if err != nil {
 			return err
 		}
-		srv.log.Info("listening securely")
 		return srv.Serve(l)
 	}
-	l, err := net.Listen("tcp", srv.config.HostPort)
+	l, err := net.Listen("tcp", srv.Addr)
 	if err != nil {
 		return err
 	}
@@ -147,16 +125,29 @@ func (srv *Server) newSession(conn net.Conn) *session {
 		// generating nanoid shouldn't really fail, and if, panicing is OK
 		panic(err)
 	}
+
 	s := &session{
-		conn:     conn,
 		id:       id,
+		conn:     conn,
 		bufin:    bufio.NewScanner(conn),
 		bufout:   bufio.NewWriter(conn),
 		srv:      srv,
-		envelope: &mail.Envelope{},
+		envelope: NewEnvelope(),
 		start:    time.Now(),
 		log:      srv.log,
+		peer: &Peer{
+			Addr:       conn.RemoteAddr(),
+			ServerName: srv.Hostname,
+		},
 	}
+
+	var tlsConn *tls.Conn
+	tlsConn, s.tls = conn.(*tls.Conn)
+	if s.tls {
+		state := tlsConn.ConnectionState()
+		s.peer.TLS = &state
+	}
+
 	// set split function so it reads to new line or 1024 bytes max
 	s.bufin.Split(limitedLineSplitter)
 	return s
@@ -170,7 +161,7 @@ func (srv *Server) Serve(ln net.Listener) error {
 		conn, err := ln.Accept()
 		if err != nil {
 			if netError, ok := err.(net.Error); ok && netError.Temporary() {
-				srv.log.Error("temporary accept error", zap.Error(err))
+				srv.log.Printf("temporary accept error %s", err.Error())
 				continue
 			}
 			return err

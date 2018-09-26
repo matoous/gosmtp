@@ -1,10 +1,9 @@
-package mta
+package gosmtp
 
 import (
 	"bytes"
 	"crypto/tls"
 	"fmt"
-	"gosmtp/mail"
 	"strings"
 
 	"github.com/signalsciences/tlstext"
@@ -79,6 +78,27 @@ func stringInSlice(a string, list []string) bool {
 type DummyMailStore struct{}
 
 // Handle discards the email
-func (dms *DummyMailStore) Handle(envelope *mail.Envelope, user string) (id string, err error) {
+func (dms *DummyMailStore) Handle(envelope *Envelope, user string) (id string, err error) {
 	return "QUEUED_MAIL_ID", nil
+}
+
+// Wrap a byte slice paragraph for use in SMTP header
+func wrap(sl []byte) []byte {
+	length := 0
+	for i := 0; i < len(sl); i++ {
+		if length > 76 && sl[i] == ' ' {
+			sl = append(sl, 0, 0)
+			copy(sl[i+2:], sl[i:])
+			sl[i] = '\r'
+			sl[i+1] = '\n'
+			sl[i+2] = '\t'
+			i += 2
+			length = 0
+		}
+		if sl[i] == '\n' {
+			length = 0
+		}
+		length++
+	}
+	return sl
 }
