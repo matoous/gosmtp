@@ -10,6 +10,7 @@ import (
 	"net/mail"
 
 	"github.com/stretchr/testify/assert"
+	"strings"
 )
 
 // dummyMailHandler dumps the email to stdout upon receiving it
@@ -31,6 +32,7 @@ func init() {
 
 	srv.Handler = dummyHandle
 	srv.RecipientChecker = dummyChecker
+	srv.Hostname = "test.com"
 
 	go func() {
 		err := srv.ListenAndServe()
@@ -38,15 +40,75 @@ func init() {
 			panic(err)
 		}
 	}()
+
+	//cert, err := tls.LoadX509KeyPair("./cert.pem", "./key.pem")
+	//config := &tls.Config{Certificates: []tls.Certificate{cert}}
+	//srv2, err := NewServer(":4345", log.New(os.Stdout, "", log.LstdFlags))
+	//if err != nil {
+	//	panic(err)
+	//}
+	//
+	//srv2.Handler = dummyHandle
+	//srv2.RecipientChecker = dummyChecker
+	//srv2.Hostname = "securetest.com"
+	//srv2.TLSConfig = config
+	//srv2.TLSOnly = true
+	//
+	//go func() {
+	//	err := srv2.ListenAndServe()
+	//	if err != nil {
+	//		panic(err)
+	//	}
+	//}()
 }
 
-func TestSession_Extensions(t *testing.T) {
-	SMTPUTF8(t)
-	PIPELINING(t)
-	HELP(t)
+func TestSession_ExtensionBDAT(t *testing.T) {
+	conn, err := smtp.Dial("localhost:4344")
+	if err != nil {
+		panic(err)
+	}
+
+	err = conn.Hello("it's me")
+	assert.NoError(t, err)
+
+	err = conn.Mail("pele@example.com")
+	assert.NoError(t, err)
+
+	err = conn.Rcpt("admin@admin.ws")
+	assert.NoError(t, err)
+
+	ok, _ := conn.Extension("CHUNKING")
+	assert.True(t, ok, "CHUNKING extension is not supported but should be")
+
+	writer := conn.Text.W
+	data := []byte("From: pele@example.com\n" +
+		"To: admin@admin.ws\n" +
+		"Subject: Hello there\n\n" +
+		"Hello!!!")
+	data2 := []byte("it's me\n")
+	writer.Write([]byte(fmt.Sprintf("BDAT %d\r\n", len(data))))
+	writer.Write(data)
+	writer.Flush()
+	resp, err := conn.Text.ReadLine()
+	assert.NoError(t, err, "didn't receive response to BDAT command")
+	assert.True(t, strings.Contains(resp, "250"), "server sent other code than 250 as response to valid BDAT command")
+
+	writer.Write([]byte(fmt.Sprintf("BDAT %d LAST\r\n", len(data2))))
+	writer.Write(data2)
+	writer.Flush()
+	resp, err = conn.Text.ReadLine()
+	assert.NoError(t, err, "didn't receive response to BDAT command")
+	assert.True(t, strings.Contains(resp, "250"), "server sent other code than 250 as response to valid BDAT command")
 }
 
-func HELP(t *testing.T) {
+func TestSession_ExtensionSTARTTLS(t *testing.T) {
+	_, err := smtp.Dial("localhost:4344")
+	if err != nil {
+		panic(err)
+	}
+}
+
+func TestSession_ExtensionHELP(t *testing.T) {
 	conn, err := net.Dial("tcp", "localhost:4344")
 	if err != nil {
 		panic(err)
@@ -62,10 +124,11 @@ func HELP(t *testing.T) {
 	_, err = conn.Write([]byte("HELP\r\n"))
 	assert.NoError(t, err, "error when sending PIPELINED commands")
 	conn.Read(x)
+
 	conn.Close()
 }
 
-func PIPELINING(t *testing.T) {
+func TestSession_ExtensionPIPELINING(t *testing.T) {
 	conn, err := net.Dial("tcp", "localhost:4344")
 	if err != nil {
 		panic(err)
@@ -87,7 +150,7 @@ func PIPELINING(t *testing.T) {
 	conn.Close()
 }
 
-func SMTPUTF8(t *testing.T) {
+func TestSession_ExtensionSMTPUTF8(t *testing.T) {
 	conn, err := smtp.Dial("localhost:4344")
 	if err != nil {
 		panic(err)
@@ -171,8 +234,39 @@ func TestSession_Serve(t *testing.T) {
 		written, err := wr.Write([]byte("Hello!"))
 		assert.NoError(t, err, "error when sending message")
 		assert.Equal(t, written, 6, "message sent only partialy")
-
-		err = wr.Close()
-		assert.NoError(t, err, "error when ending sending message")
 	}
+
+	err = conn.Quit()
+	assert.NoError(t, err, "error when sending RCPT")
+}
+
+func TestSession_handleEhlo(t *testing.T) {
+	conn, err := smtp.Dial("localhost:4344")
+	if err != nil {
+		panic(err)
+	}
+
+	err = conn.Hello("it's me")
+	assert.NoError(t, err, "error when sending hello")
+
+	has, _ := conn.Extension("PIPELINING")
+	assert.True(t, has, "gosmtp should support PIPELINING")
+
+	has, _ = conn.Extension("8BITMIME")
+	assert.True(t, has, "gosmtp should support 8BITMIME")
+
+	has, _ = conn.Extension("CHUNKING")
+	assert.True(t, has, "gosmtp should support CHUNKING")
+
+	has, _ = conn.Extension("BINARYMIME")
+	assert.True(t, has, "gosmtp should support BINARYMIME")
+
+	has, _ = conn.Extension("SMTPUTF8")
+	assert.True(t, has, "gosmtp should support SMTPUTF8")
+
+	has, _ = conn.Extension("HELP")
+	assert.True(t, has, "gosmtp should support HELP")
+
+	has, _ = conn.Extension("SIZE")
+	assert.True(t, has, "gosmtp should support SIZE")
 }

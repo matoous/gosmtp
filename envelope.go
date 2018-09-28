@@ -89,6 +89,11 @@ func (e *Envelope) Write(line []byte) (int, error) {
 	return e.data.Write(line)
 }
 
+// Write writes bytes to envelope buffer
+func (e *Envelope) WriteString(line string) (int, error) {
+	return e.data.WriteString(line)
+}
+
 // WriteLine writes data to envelope followed by new line
 func (e *Envelope) WriteLine(line []byte) (int, error) {
 	return e.data.Write(append(line, []byte("\r\n")...))

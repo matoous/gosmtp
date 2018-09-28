@@ -1,16 +1,16 @@
 package gosmtp
 
-import (
+import 	(
 	"bufio"
 	"bytes"
 	"crypto/tls"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 type sessionState int
@@ -30,11 +30,8 @@ const (
 type Protocol string
 
 const (
-	// SMTP - plain old SMTP
-	SMTP Protocol = "SMTP"
-
-	// ESMTP - Extended SMTP
-	ESMTP = "ESMTP"
+	SMTP Protocol = "SMTP" // SMTP - plain old SMTP
+	ESMTP = "ESMTP" // ESMTP - Extended SMTP
 )
 
 // Peer represents the client connecting to the server
@@ -53,8 +50,7 @@ type Peer struct {
 // session wraps underlying SMTP connection for easier handling
 type session struct {
 	conn   net.Conn       // connection
-	bufin  *bufio.Scanner // scanner
-	bufout *bufio.Writer  // writer
+	bufio *bufio.ReadWriter // buffered input/output
 	id     string         // email id
 
 	envelope         *Envelope    // session envelope
@@ -86,9 +82,13 @@ func (s *session) Reset() {
 }
 
 // DoneAndReset resets current after receiving DATA successfully
-func (s *session) DoneAndReset() {
-	s.envelope.Reset()
-	s.state = sessionStateInit
+func (s *session) ReadLine() (string, error) {
+	input, err := s.bufio.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	// trim \r\n
+	return input[:len(input)-2], nil
 }
 
 func (s *session) Out(msgs ...string) {
@@ -97,10 +97,10 @@ func (s *session) Out(msgs ...string) {
 
 	s.conn.SetWriteDeadline(time.Now().Add(DefaultLimits.ReplyOut))
 	for _, msg := range msgs {
-		s.bufout.WriteString(msg)
-		s.bufout.Write([]byte("\r\n"))
+		s.bufio.WriteString(msg)
+		s.bufio.Write([]byte("\r\n"))
 	}
-	if err := s.bufout.Flush(); err != nil {
+	if err := s.bufio.Flush(); err != nil {
 		s.log.Printf("ERROR: flush error: %s", err.Error())
 		s.state = sessionStateAborted
 	}
@@ -116,9 +116,21 @@ func (s *session) Serve() {
 	s.handleWelcome()
 
 	// for each received command
-	for s.bufin.Scan() {
-		cmd, err := parseCommand(s.bufin.Text())
+	for {
+		// TODO can we?
+		if s.badCommandsCount >= s.srv.Limits.BadCmds {
+			s.Out(Codes.FailMaxUnrecognizedCmd)
+			s.state = sessionStateAborted
+			break
+		}
+		line, err := s.ReadLine()
 		if err != nil {
+			s.log.Printf("ERROR: %s", err.Error())
+			break
+		}
+		cmd, err := parseCommand(strings.TrimRightFunc(line, unicode.IsSpace))
+		if err != nil {
+			s.log.Printf("ERROR: unrecognized command: '%s'\n", strings.TrimRightFunc(line, unicode.IsSpace))
 			s.Out(Codes.FailUnrecognizedCmd)
 			s.badCommandsCount++
 			continue
@@ -135,17 +147,8 @@ func (s *session) Serve() {
 		if s.state == sessionStateAborted {
 			break
 		}
-		// TODO is this legal?
-		if s.badCommandsCount == s.srv.Limits.BadCmds {
-			s.Out(Codes.FailMaxUnrecognizedCmd)
-			s.state = sessionStateAborted
-			break
-		}
 		// TODO timeout might differ as per https://tools.ietf.org/html/rfc5321#section-4.5.3.2
 		s.conn.SetReadDeadline(time.Now().Add(s.srv.Limits.CmdInput))
-	}
-	if err := s.bufin.Err(); err != nil {
-		s.log.Printf("ERROR: bufin error: '%s'", err.Error())
 	}
 }
 
@@ -266,8 +269,10 @@ func handleStartTLS(s *session, cmd *command) {
 	// reset session
 	s.Reset()
 	s.conn = secureConn
-	s.bufin = bufio.NewScanner(secureConn)
-	s.bufout = bufio.NewWriter(secureConn)
+	s.bufio = bufio.NewReadWriter(
+		bufio.NewReader(s.conn),
+		bufio.NewWriter(s.conn),
+	)
 	s.tls = true
 	s.tlsState = secureConn.ConnectionState()
 	s.peer.TLS = &s.tlsState
@@ -427,17 +432,15 @@ func handleRcpt(s *session, cmd *command) {
 		routes in the forward-path, but they SHOULD ignore the routes or MAY
 		decline to support the relaying they imply.
 	*/
+	// must be implemented - RFC5321
+	if strings.ToLower(toParts[1]) == "<postmaster>" {
+		toParts[1] = "<postmaster@" + s.peer.ServerName + ">"
+	}
 
 	rcpt, err := parseAddress(toParts[1])
 	if err != nil {
 		s.Out(Codes.FailInvalidAddress)
 		return
-	}
-
-	// must be implemented - RFC5321
-	// TODO check we get here
-	if strings.ToLower(rcpt.Address) == "postmaster" {
-		rcpt.Address = "postmaster@" + s.peer.ServerName
 	}
 
 	// be relay for authenticated User
@@ -538,21 +541,20 @@ func handleData(s *session, cmd *command) {
 	// TODO https://tools.ietf.org/html/rfc5321#section-4.5.3.1.6
 	// read data, stop on EOF or reaching maximum sizes
 	var size int64
-	for s.bufin.Scan() && size < s.srv.Limits.MsgSize {
-		if s.bufin.Text() == "." {
+	for size < s.srv.Limits.MsgSize {
+		line, err := s.bufio.ReadString('\n')
+		if err != nil {
+			s.Out(fmt.Sprintf(Codes.FailReadErrorDataCmd, err))
+			s.state = sessionStateAborted
+			return
+		}
+		line = strings.TrimSpace(line)
+		if line == "." {
 			break
 		}
-		x := s.bufin.Bytes()
-		size += int64(len(x))
-		s.envelope.Write(x)
+		size += int64(len(line))
+		s.envelope.WriteString(line)
 		s.envelope.Write([]byte("\r\n"))
-	}
-	// reading ended with error
-	if err := s.bufin.Err(); err != nil {
-		s.log.Printf("ERROR: bufin: '%s'", err.Error())
-		s.Out(fmt.Sprintf(Codes.FailReadErrorDataCmd, err))
-		s.state = sessionStateAborted
-		return
 	}
 
 	// reading ended by reaching maximum size
@@ -576,7 +578,7 @@ func handleData(s *session, cmd *command) {
 
 	// data done
 	s.envelope.Close()
-	s.state = sessionStateDataDone
+	s.state = sessionStateWaitingForQuit
 
 	// add envelope to delivery system
 	id, err := s.srv.Handler(s.peer, s.envelope)
@@ -587,7 +589,7 @@ func handleData(s *session, cmd *command) {
 	}
 
 	// reset session
-	s.DoneAndReset()
+	s.Reset()
 	return
 }
 
@@ -649,22 +651,29 @@ func handleBdat(s *session, cmd *command) {
 		last = true
 	}
 
+	s.log.Printf("INFO: received BDAT command, last: %t, data length: %d", last, chunkSize64)
 	/*
 		The message data is sent immediately after the trailing <CR>
 		<LF> of the BDAT command line.  Once the receiver-SMTP receives the
 		specified number of octets, it will return a 250 reply code.
-	*/
-	lr := io.LimitReader(s.conn, chunkSize64)
-	/*
+
 		If a failure occurs after a BDAT command is
 		received, the receiver-SMTP MUST accept and discard the associated
 		message data before sending the appropriate 5XX or 4XX code.
 	*/
-	if n, err := io.Copy(s.envelope.data, lr); err != nil {
+	resp := make([]byte, chunkSize64)
+	if n, err := s.bufio.Read(resp); err != nil {
 		s.Out(fmt.Sprintf(Codes.FailReadErrorDataCmd, err))
 		s.state = sessionStateAborted
 		return
-	} else if n != chunkSize64 {
+	} else if int64(n) != chunkSize64 {
+		s.Out(fmt.Sprintf(Codes.FailReadErrorDataCmd, err))
+		s.state = sessionStateAborted
+		return
+	}
+
+	n, err := s.envelope.Write(resp)
+	if int64(n) != chunkSize64 {
 		s.Out(fmt.Sprintf(Codes.FailReadErrorDataCmd, err))
 		s.state = sessionStateAborted
 		return
@@ -672,7 +681,7 @@ func handleBdat(s *session, cmd *command) {
 
 	if last {
 		// data done
-		s.Out("250 Message ok, TOTAL octets received") // TODO
+		s.Out(fmt.Sprintf("250 BDAT ok, BDAT finished, %d octets received", s.envelope.data.Len()))
 		s.envelope.Close()
 		s.state = sessionStateDataDone
 	} else {
@@ -680,7 +689,7 @@ func handleBdat(s *session, cmd *command) {
 			A 250 response MUST be sent to each successful BDAT data block within
 			a mail transaction.
 		*/
-		s.Out(fmt.Sprintf("250 %d octets received", chunkSize64))
+		s.Out(fmt.Sprintf("250 BDAT ok, %d octets received", chunkSize64))
 	}
 }
 func handleExpn(s *session, _ *command) {

@@ -3,6 +3,7 @@ package gosmtp
 import (
 	"encoding/base64"
 	"strings"
+	"unicode"
 )
 
 /*
@@ -16,52 +17,57 @@ func (s *session) handleLoginAuth(cmd *command) {
 	var username string
 	var password []byte
 	if len(args) == 1 {
-		s.Out("334 VXNlcm5hbWU6")
-		s.bufin.Scan()
-		cmd := strings.TrimSpace(s.bufin.Text())
+		line, err := s.ReadLine()
+		if err != nil {
+			s.state = sessionStateAborted
+			return
+		}
+		cmd := strings.TrimRightFunc(line, unicode.IsSpace)
 		s.log.Printf("INFO: received AUTH cmd: '%s'", cmd)
 		data, err := base64.StdEncoding.DecodeString(cmd)
 		if err != nil {
 			s.Out("501 malformed auth input")
-			s.log.Printf("DEBUG: malformed auth input: '%s'", cmd)
-			s.state = sessionStateAborted
+			s.badCommandsCount++
 			return
 		}
 		username = string(data)
 		s.Out("334 UGFzc3dvcmQ6")
-		s.bufin.Scan()
-		cmd = strings.TrimSpace(s.bufin.Text())
+		line, err = s.ReadLine()
+		if err != nil {
+			s.state = sessionStateAborted
+			return
+		}
+		cmd = strings.TrimRightFunc(line, unicode.IsSpace)
 		s.log.Printf("INFO: received second AUTH cmd: '%s'", cmd)
 		password, err = base64.StdEncoding.DecodeString(cmd)
 		if err != nil {
 			s.Out("501 malformed auth input")
-			s.log.Printf("DEBUG: malformed auth input: '%s'", cmd)
-			s.state = sessionStateAborted
 			return
 		}
 	} else if len(args) == 2 {
 		data, err := base64.StdEncoding.DecodeString(args[1])
 		if err != nil {
 			s.Out("501 malformed auth input")
-			s.log.Printf("DEBUG: malformed auth input: '%s'", cmd)
-			s.state = sessionStateAborted
 			return
 		}
 		username = string(data)
 		s.Out("334 UGFzc3dvcmQ6")
-		s.bufin.Scan()
-		cmd := s.bufin.Text()
+		line, err := s.ReadLine()
+		if err != nil {
+			s.Out(Codes.FailLineTooLong)
+			s.badCommandsCount++
+			return
+		}
+		cmd := strings.TrimRightFunc(line, unicode.IsSpace)
 		s.log.Printf("INFO: received second AUTH cmd: '%s'", cmd)
 		password, err = base64.StdEncoding.DecodeString(cmd)
 		if err != nil {
 			s.Out("501 malformed auth input")
-			s.log.Printf("DEBUG: malformed auth input: '%s'", cmd)
 			s.state = sessionStateAborted
 			return
 		}
 	}
 
-	// check login
 	// check login
 	s.peer.Username = username
 	ok, err := s.srv.Authenticator(s.peer, password)
@@ -72,13 +78,13 @@ func (s *session) handleLoginAuth(cmd *command) {
 	}
 	if !ok {
 		s.Out(Codes.FailAuthentication)
-		s.state = sessionStateAborted
 		return
 	}
 
 	// login succeeded
 	s.peer.Authenticated = true
 	s.Out(Codes.SuccessAuthentication)
+	return
 }
 
 func (s *session) handlePlainAuth(cmd *command) {
@@ -88,26 +94,29 @@ func (s *session) handlePlainAuth(cmd *command) {
 	// check that PLAIN auth input is of valid form
 	if len(args) == 1 {
 		s.Out("334")
-		s.bufin.Scan()
-		cmd, err := parseCommand(s.bufin.Text())
+		line, err := s.ReadLine()
+		if err != nil {
+			s.state = sessionStateAborted
+			return
+		}
+		cmd, err := parseCommand(strings.TrimRightFunc(line, unicode.IsSpace))
 		s.log.Printf("INFO: received AUTH cmd: '%s'", cmd)
 		if err != nil {
 			s.Out(Codes.FailUnrecognizedCmd)
 			s.badCommandsCount++
+			return
 		}
 		authData, err = base64.StdEncoding.DecodeString(cmd.arguments[0])
 		if err != nil {
 			s.Out("501 malformed auth input")
-			s.log.Printf("DEBUG: malformed auth input: '%s'", cmd)
-			s.state = sessionStateAborted
+			s.badCommandsCount++
 			return
 		}
 	} else if len(args) == 2 {
 		authData, err = base64.StdEncoding.DecodeString(args[1])
 		if err != nil {
 			s.Out("501 malformed auth input")
-			s.log.Printf("DEBUG: malformed auth input: '%s'", cmd)
-			s.state = sessionStateAborted
+			s.badCommandsCount++
 			return
 		}
 	}
@@ -136,11 +145,10 @@ func (s *session) handlePlainAuth(cmd *command) {
 	}
 	if !ok {
 		s.Out(Codes.FailAuthentication)
-		s.state = sessionStateAborted
 		return
 	}
-	s.peer.Authenticated = true
-
 	// login succeeded
+	s.peer.Authenticated = true
 	s.Out(Codes.SuccessAuthentication)
+	return
 }

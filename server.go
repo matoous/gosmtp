@@ -129,8 +129,10 @@ func (srv *Server) newSession(conn net.Conn) *session {
 	s := &session{
 		id:       id,
 		conn:     conn,
-		bufin:    bufio.NewScanner(conn),
-		bufout:   bufio.NewWriter(conn),
+		bufio:    bufio.NewReadWriter(
+			bufio.NewReader(conn),
+			bufio.NewWriter(conn),
+		),
 		srv:      srv,
 		envelope: NewEnvelope(),
 		start:    time.Now(),
@@ -149,7 +151,6 @@ func (srv *Server) newSession(conn net.Conn) *session {
 	}
 
 	// set split function so it reads to new line or 1024 bytes max
-	s.bufin.Split(limitedLineSplitter)
 	return s
 }
 
