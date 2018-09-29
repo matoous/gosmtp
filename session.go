@@ -1,6 +1,6 @@
 package gosmtp
 
-import 	(
+import (
 	"bufio"
 	"bytes"
 	"crypto/tls"
@@ -30,8 +30,8 @@ const (
 type Protocol string
 
 const (
-	SMTP Protocol = "SMTP" // SMTP - plain old SMTP
-	ESMTP = "ESMTP" // ESMTP - Extended SMTP
+	SMTP  Protocol = "SMTP"  // SMTP - plain old SMTP
+	ESMTP          = "ESMTP" // ESMTP - Extended SMTP
 )
 
 // Peer represents the client connecting to the server
@@ -49,9 +49,9 @@ type Peer struct {
 
 // session wraps underlying SMTP connection for easier handling
 type session struct {
-	conn   net.Conn       // connection
+	conn  net.Conn          // connection
 	bufio *bufio.ReadWriter // buffered input/output
-	id     string         // email id
+	id    string            // email id
 
 	envelope         *Envelope    // session envelope
 	state            sessionState // session state
@@ -197,6 +197,8 @@ func handleEhlo(s *session, cmd *command) {
 	ehloResp = append(ehloResp, "250-SMTPUTF8")
 	// https://tools.ietf.org/html/rfc2920
 	ehloResp = append(ehloResp, "250-PIPELINING")
+	// https://tools.ietf.org/html/rfc6710
+	ehloResp = append(ehloResp, "250-MT-PRIORITY")
 	// https://tools.ietf.org/html/rfc3207
 	if s.srv.TLSConfig != nil { // do tls for this server
 		if !s.tls { // already in tls stream
@@ -370,6 +372,26 @@ func handleMail(s *session, cmd *command) {
 				   address which can be used as a substitute for the corresponding
 				   primary (i18mail) address when downgrading.
 				*/
+			case "AUTH":
+				/*
+					An optional parameter using the keyword "AUTH" is added to the
+					MAIL FROM command, and extends the maximum line length of the
+					MAIL FROM command by 500 characters.
+				*/
+			case "MT-PRIORITY":
+				/*
+					https://tools.ietf.org/html/rfc6710
+				*/
+				priority, err := strconv.ParseInt(extValue[1], 10, 64)
+				if err != nil {
+					s.Out(Codes.FailInvalidExtension)
+					return
+				}
+				if priority > 9 || priority < -9 {
+					s.Out(Codes.FailInvalidExtension)
+					return
+				}
+				s.envelope.Priority = int(priority)
 			default:
 				s.Out("555")
 				s.envelope.MailFrom = nil
@@ -443,21 +465,38 @@ func handleRcpt(s *session, cmd *command) {
 		return
 	}
 
-	// be relay for authenticated User
-	if !s.peer.Authenticated {
-		// check valid recipient if this email comes from outside
-		err := s.srv.RecipientChecker(s.peer, rcpt)
-		if err != nil {
-			if err == ErrorRecipientNotFound {
-				s.Out(Codes.FailMailboxDoesntExist)
-				return
-			}
-			if err == ErrorRecipientsMailboxFull {
-				s.Out(Codes.FailMailboxFull)
-				return
-			}
-			s.Out(Codes.FailAccessDenied)
+	// check valid recipient if this email comes from outside
+	err = s.srv.RecipientChecker(s.peer, rcpt)
+	if err != nil {
+		if err == ErrorRecipientNotFound {
+			s.Out(Codes.FailMailboxDoesntExist)
 			return
+		}
+		if err == ErrorRecipientsMailboxFull {
+			s.Out(Codes.FailMailboxFull)
+			return
+		}
+		s.Out(Codes.FailAccessDenied)
+		return
+	}
+
+	// extensions size
+	if len(args) > 0 {
+		for _, ext := range args {
+			extValue := strings.Split(ext, "=")
+			if len(extValue) != 2 {
+				s.Out(Codes.FailInvalidAddress)
+				return
+			}
+			switch strings.ToUpper(extValue[0]) {
+			case "RRVS":
+				// https://tools.ietf.org/html/rfc7293
+				since, err := time.Parse(time.RFC3339, extValue[1])
+				s.log.Printf("INFO: client requested Require-Recipient-Valid-Since check: %#v %#v\n", since, err)
+			default:
+				s.Out("555")
+				s.envelope.MailFrom = nil
+			}
 		}
 	}
 
@@ -486,9 +525,7 @@ func handleRcpt(s *session, cmd *command) {
 func handleVrfy(s *session, _ *command) {
 	/*
 		https://tools.ietf.org/html/rfc5336
-		UTF8REPLY
-	*/
-	/*
+
 		For the VRFY command, the string is a user name or a user name and
 		domain (see below).  If a normal (i.e., 250) response is returned,
 		the response MAY include the full name of the user and MUST include
@@ -500,8 +537,8 @@ func handleVrfy(s *session, _ *command) {
 
 	*/
 	s.vrfyCount++
-
-	// TODO implement vrfy
+	s.Out("252 send some mail, i'll try my best")
+	return
 }
 
 func handleData(s *session, cmd *command) {
@@ -696,18 +733,6 @@ func handleExpn(s *session, _ *command) {
 	s.Out("252")
 }
 
-// Tempfail temporarily rejects the current SMTP command
-func (s *session) Tempfail(cmd *command) {
-	switch cmd.commandCode {
-	case heloCmd, ehloCmd:
-		s.Out("421 Not available now")
-	case authCmd:
-		s.Out("454 Temporary authentication failure")
-	case mailCmd, rcptCmd, dataCmd:
-		s.Out("450 Not available")
-	}
-}
-
 // authMechanismValid checks if selected authentication mechanism is available
 func (s *session) authMechanismValid(mech string) bool {
 	mech = strings.ToUpper(mech)
@@ -798,32 +823,22 @@ func (s *session) ReceivedHeader() []byte {
 
 	receivedHeader := bytes.NewBufferString("Received: from ")
 
-	// host and IP
-	receivedHeader.WriteString(remoteHost)
-	receivedHeader.WriteString(" (")
-	receivedHeader.WriteString(remoteHost)
-	receivedHeader.WriteByte(':')
-	receivedHeader.WriteString(remotePort)
-
 	// authenticated
+	auth := ""
 	if s.peer.Authenticated {
-		receivedHeader.WriteString(" authenticated as ")
-		receivedHeader.WriteString(s.peer.Username)
+		auth = " authenticated as " + s.peer.Username
 	}
-	receivedHeader.WriteString(") ")
+
+	// host and IP
+	receivedHeader.WriteString(fmt.Sprintf("%s (%s:%s %s)", remoteHost, remoteIP, remotePort, auth))
 
 	// TLS
 	if s.tls {
 		receivedHeader.WriteString(tlsInfo(&s.tlsState))
-		receivedHeader.WriteByte(' ')
 	}
 
 	// local
-	receivedHeader.WriteString("by ")
-	receivedHeader.WriteString(localIP)
-	receivedHeader.WriteString(" (")
-	receivedHeader.WriteString(localHost)
-	receivedHeader.WriteByte(')')
+	receivedHeader.WriteString(fmt.Sprintf(" by %s (%s)", localIP, localHost))
 
 	// proto
 	if s.tls {
@@ -833,20 +848,18 @@ func (s *session) ReceivedHeader() []byte {
 	}
 
 	// mamail version
-	receivedHeader.WriteString(" gomstp(0.0.1)")
-
-	receivedHeader.WriteString("; id ")
-	receivedHeader.WriteString(s.id)
+	receivedHeader.WriteString("gomstp(0.0.1); id " + s.id)
 
 	// timestamp
-	receivedHeader.WriteString("; ")
-	receivedHeader.WriteString(time.Now().Format(time.RFC1123))
-	receivedHeader.WriteString("\r\n")
+	receivedHeader.WriteString("; " + time.Now().Format(time.RFC1123) + "\r\n")
 
-	header := receivedHeader.Bytes()
+	return wrap(receivedHeader.Bytes())
+}
 
-	// fold header
-	return wrap(header)
+func (s *session) Reject() {
+	s.Out("421 Too busy. Try again later.")
+	s.state = sessionStateAborted
+	return
 }
 
 var handlers = []func(s *session, cmd *command){

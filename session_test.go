@@ -4,10 +4,10 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/mail"
 	"net/smtp"
 	"os"
 	"testing"
-	"net/mail"
 
 	"github.com/stretchr/testify/assert"
 	"strings"

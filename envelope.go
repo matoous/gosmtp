@@ -9,18 +9,19 @@ import (
 
 // Envelope represents a message envelope
 type Envelope struct {
-	MailFrom *mail.Address       // Envelope sender
-	MailTo   []*mail.Address     // Envelope recipients
-	Mail *mail.Message // Final message
+	MailFrom *mail.Address   // Envelope sender
+	MailTo   []*mail.Address // Envelope recipients
+	Mail     *mail.Message   // Final message
+	Priority int
 
-	data     *bytes.Buffer // data stores the header and message body
-	headers  map[string]string        // New headers added by server
+	data    *bytes.Buffer     // data stores the header and message body
+	headers map[string]string // New headers added by server
 }
 
 func NewEnvelope() *Envelope {
 	return &Envelope{
-		MailTo: []*mail.Address{},
-		data: bytes.NewBufferString(""),
+		MailTo:  []*mail.Address{},
+		data:    bytes.NewBufferString(""),
 		headers: make(map[string]string),
 	}
 }
@@ -84,17 +85,17 @@ func (e *Envelope) BeginData() error {
 	return nil
 }
 
-// Write writes bytes to envelope buffer
+// Write writes bytes into the envelope buffer
 func (e *Envelope) Write(line []byte) (int, error) {
 	return e.data.Write(line)
 }
 
-// Write writes bytes to envelope buffer
+// WriteString writes string into the envelope buffer
 func (e *Envelope) WriteString(line string) (int, error) {
 	return e.data.WriteString(line)
 }
 
-// WriteLine writes data to envelope followed by new line
+// WriteLine writes data into the envelope followed by new line
 func (e *Envelope) WriteLine(line []byte) (int, error) {
 	return e.data.Write(append(line, []byte("\r\n")...))
 }

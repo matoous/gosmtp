@@ -38,8 +38,8 @@ type Server struct {
 	Hostname       string      // hostname, e.g. the domain which the server runs on
 	TLSConfig      *tls.Config // TLS configuration
 	TLSOnly        bool
-	log            *log.Logger          // servers logger
-	authMechanisms []string             // announced authentication mechanisms
+	log            *log.Logger // servers logger
+	authMechanisms []string    // announced authentication mechanisms
 
 	shuttingDown bool // is the server shutting down?
 
@@ -59,8 +59,8 @@ type Server struct {
 	// Can be left empty for no restrictions.
 	// If an error is returned, it will be reported in the SMTP session.
 	// Use the Error struct for access to error codes.
-	ConnectionChecker func(peer *Peer) error              // Called upon new connection.
-	HeloChecker       func(peer *Peer, name string) error // Called after HELO/EHLO.
+	ConnectionChecker func(peer *Peer) error                     // Called upon new connection.
+	HeloChecker       func(peer *Peer, name string) error        // Called after HELO/EHLO.
 	SenderChecker     func(peer *Peer, addr *mail.Address) error // Called after MAIL FROM.
 	RecipientChecker  func(peer *Peer, addr *mail.Address) error // Called after each RCPT TO.
 }
@@ -127,9 +127,9 @@ func (srv *Server) newSession(conn net.Conn) *session {
 	}
 
 	s := &session{
-		id:       id,
-		conn:     conn,
-		bufio:    bufio.NewReadWriter(
+		id:   id,
+		conn: conn,
+		bufio: bufio.NewReadWriter(
 			bufio.NewReader(conn),
 			bufio.NewWriter(conn),
 		),
