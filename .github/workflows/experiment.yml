@@ -1,0 +1,11 @@
+name: Experiment
+on: [push]
+jobs:
+  first_job:
+    name: My Job Name
+    runs-on: ubuntu-latest
+    steps:
+      - name: Experiment2
+        uses: matoous/golangci-lint-action@v0.0.2
+      - name: Experiment
+        uses: docker://matousdz/golangci-lint-action:v0.0.2
