@@ -3,6 +3,8 @@ github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/go-errors/errors v1.0.1 h1:LUHzmkK3GUKUrL/1gfBUxAHzcev3apQlezX/+O7ma6w=
 github.com/go-errors/errors v1.0.1/go.mod h1:f4zRHt4oKfwPJE5k8C9vpYG+aDHdBFUsgrm6/TyX73Q=
+github.com/go-errors/errors v1.1.0 h1:Cp9jcHYqBe2WcBWsAgnXSpKJx7ns0KaYoy2KeZe6dsU=
+github.com/go-errors/errors v1.1.0/go.mod h1:psDX2osz5VnTOnFWbDeWwS7yejl+uV3FEWEp4lssFEs=
 github.com/matoous/go-nanoid v0.0.0-20180926092311-3de1538a83bc h1:5wtRu6KKNRIzkeBu11K8cyM8iUcZ0TOq9zh9HIx5dIc=
 github.com/matoous/go-nanoid v0.0.0-20180926092311-3de1538a83bc/go.mod h1:soqXi4beH2aAljcVvgIDqekDtnM2UZkGl47fniwq3J4=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
